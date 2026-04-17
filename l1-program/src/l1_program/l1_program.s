@@ -78,7 +78,13 @@
 .equ ERR_WITHDRAW_EXCEEDS_BAL,  0xE
 
 
+.rodata
+seed_state: .ascii "state"
+seed_vault: .ascii "vault"
+
+.text
 .globl entrypoint
+
 
 entrypoint:
     ; ── Dynamic account walk: save base ptrs to stack, land on ix_data ────────
@@ -141,12 +147,120 @@ initialize:
     jne r2, STATE_SZ, err_wrong_acct_size
 
     ; acct1.data[STATE_INITIALIZED] == 0
-    ldxdw r2, [r3 + ACCT_DATA + STATE_INITIALIZED]
-    jne r2, 0x0, err_already_initialized
-    
-    
+    ldxb r2, [r3 + ACCT_DATA]   ; STATE_INITIALIZED = 0x00
+    jne  r2, 0x0, err_already_initialized
 
-    lddw r0, 0
+    mov64 r8, r3
+
+    ; SolBytes[0].ptr = &"state"
+    mov64 r5, r10
+    sub64 r5, 64
+    lddw  r2, seed_state
+    stxdw [r5 + 0], r2
+
+    ; SolBytes[0].len = 5
+    mov64 r2, 5
+    stxdw [r5 + 8],  r2
+
+    ; SolBytes[1].ptr = &bump, SolBytes[1].len = 1
+    ldxb r2, [r7 + 0x29]   ; r7+8 = ix_data[0], +0x21 = INIT_STATE_BUMP
+    stxb  [r10 - 88], r2                ; bump byte on stack
+    mov64 r2, r10
+    sub64 r2, 88
+    stxdw [r5 + 16], r2                 ; SolBytes[1].ptr
+    mov64 r2, 1
+    stxdw [r5 + 24], r2                 ; SolBytes[1].len
+
+    ; program_id ptr = r7 + 8 + ix_data_len
+    ldxdw r3, [r7 + 0]
+    mov64 r4, r7
+    add64 r4, 8
+    add64 r4, r3            ; r4 = program_id ptr (use r4, not r3, keep r3 free)
+
+    ; out buffer at r10-120
+    ; call
+    mov64 r1, r5            ; SolBytes array
+    mov64 r2, 2
+    mov64 r3, r4            ; program_id
+    mov64 r4, r10
+    sub64 r4, 120
+    call  sol_create_program_address
+    jne   r0, 0, err_bad_pda
+
+    ; compare out with acct1.key  (r8 = acct1 ptr, saved earlier)
+    mov64 r1, r10
+    sub64 r1, 120
+    mov64 r2, r8
+    add64 r2, ACCT_KEY
+    call  cmp32
+    jne   r0, 0, err_bad_pda
+
+    ; ── step 8: verify vault PDA ──────────────────────
+    lddw  r2, seed_vault
+    stxdw [r5 + 0], r2              ; SolBytes[0].ptr = &"vault"
+    ; SolBytes[0].len already = 5, SolBytes[1].len already = 1 — reuse
+
+    ldxb  r2, [r7 + 0x2a]           ; ix_data[0x22] = INIT_VAULT_BUMP
+    stxb  [r10 - 88], r2            ; overwrite bump byte
+
+    ldxdw r3, [r7 + 0]
+    mov64 r4, r7
+    add64 r4, 8
+    add64 r4, r3
+
+    mov64 r1, r5
+    mov64 r2, 2
+    mov64 r3, r4
+    mov64 r4, r10
+    sub64 r4, 120
+    call  sol_create_program_address
+    jne   r0, 0, err_bad_pda
+
+    mov64 r1, r10
+    sub64 r1, 120
+    ldxdw r2, [r10 - 24]            ; acct2 ptr
+    add64 r2, ACCT_KEY
+    call  cmp32
+    jne   r0, 0, err_bad_pda
+
+    ; ── step 9: write state fields ────────────────────
+    mov64 r6, r8
+    add64 r6, ACCT_DATA            ; r6 = &state.data[0]
+
+    ; STATE_INITIALIZED = 1
+    mov64 r2, 1
+    stxb  [r6 + STATE_INITIALIZED], r2
+
+    ; STATE_SEQ_PUBKEY = ix_data[1..33]
+    mov64 r1, r6
+    add64 r1, STATE_SEQ_PUBKEY     ; dst
+    mov64 r2, r7
+    add64 r2, 9                    ; src = ix_data[1]  (r7+8=ix_data[0], +1=INIT_SEQ_PUBKEY)
+    call  copy32
+
+    ; STATE_ROOT = zero
+    mov64 r1, r6
+    add64 r1, STATE_ROOT
+    call  zero32
+
+    ; STATE_BATCH_NUM = 0, STATE_VAULT_LAMPORTS = 0
+    mov64 r2, 0
+    stxdw [r6 + STATE_BATCH_NUM], r2
+    stxdw [r6 + STATE_VAULT_LAMPORTS], r2
+
+    ; STATE_BUMP = ix_data[0x21]
+    ldxb  r2, [r7 + 0x29]
+    stxb  [r6 + STATE_BUMP], r2
+
+    ; STATE_VAULT_BUMP = ix_data[0x22]
+    ldxb  r2, [r7 + 0x2a]
+    stxb  [r6 + STATE_VAULT_BUMP], r2
+
+    ; STATE_WITHDRAW_MASK = 0
+    mov64 r2, 0
+    stxh  [r6 + STATE_WITHDRAW_MASK], r2
+
+    lddw  r0, 0
     exit
 
 update_state_root:
