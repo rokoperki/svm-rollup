@@ -470,6 +470,192 @@ deposit:
     exit
 
 withdraw:
+    ; num_accounts == 4
+    ldxdw r3, [r1 + NUM_ACCOUNTS]
+    jne r3, 4, err_wrong_acct_count
+
+    ; ix_data_len >= WD_IX_LEN
+    ldxdw r3, [r7 + 0]
+    jlt r3, WD_IX_LEN, err_invalid_ix
+
+    ; acct0.is_signer == 1
+    ldxdw r3, [r10 - 8]
+    ldxb r2, [r3 + ACCT_IS_SIGNER]
+    jne r2, 1, err_not_signer
+
+    ; acct2.dlen == STATE_SZ
+    ldxdw r3, [r10 - 24]
+    ldxdw r2, [r3 + ACCT_DLEN]
+    jne r2, STATE_SZ, err_wrong_acct_size
+
+    ; acct2.data[STATE_INITIALIZED] == 1
+    ldxb r2, [r3 + ACCT_DATA + STATE_INITIALIZED]
+    jne r2, 1, err_not_initialized
+
+    mov64 r8, r3                    ; save acct2 ptr (callee-saved)
+    mov64 r9, r1
+
+    ; WD_AMOUNT <= WD_L2_LAMPORTS
+    ldxdw r1, [r7 + 8 + WD_AMOUNT]
+    ldxdw r2, [r7 + 8 + WD_L2_LAMPORTS]
+    jgt r1, r2, err_withdraw_exceeds_bal
+
+    ; STATE_VAULT_LAMPORTS >= WD_AMOUNT
+    ldxdw r2, [r8 + ACCT_DATA + STATE_VAULT_LAMPORTS]
+    jgt r1, r2, err_insufficient_vault
+
+    ; bit WD_PROOF_INDEX not set in STATE_WITHDRAW_MASK
+    ldxw r3, [r7 + 8 + WD_PROOF_INDEX]
+    and64 r3, 0xF
+    ldxh r2, [r8 + ACCT_DATA + STATE_WITHDRAW_MASK]
+    mov64 r4, 1
+    lsh64 r4, r3
+    and64 r2, r4
+    jne r2, 0, err_already_withdrawn
+
+    ; ── verify vault PDA ──────────────────────
+    mov64 r5, r10
+    sub64 r5, 64                    ; r5 = SolBytes array base
+
+    lddw  r2, seed_vault
+    stxdw [r5 + 0], r2              ; SolBytes[0].ptr = &"vault"
+    mov64 r2, 5
+    stxdw [r5 + 8], r2              ; SolBytes[0].len = 5
+
+    ldxb  r2, [r8 + ACCT_DATA + STATE_VAULT_BUMP]  ; bump from state data
+    stxb  [r10 - 88], r2            ; bump byte on stack
+    mov64 r2, r10
+    sub64 r2, 88
+    stxdw [r5 + 16], r2             ; SolBytes[1].ptr = &bump
+    mov64 r2, 1
+    stxdw [r5 + 24], r2             ; SolBytes[1].len = 1
+
+    ldxdw r3, [r7 + 0]
+    mov64 r4, r7
+    add64 r4, 8
+    add64 r4, r3                    ; r4 = program_id ptr
+
+    mov64 r1, r5
+    mov64 r2, 2
+    mov64 r3, r4
+    mov64 r4, r10
+    sub64 r4, 120
+    call  sol_create_program_address
+    jne   r0, 0, err_bad_pda
+
+    mov64 r1, r10
+    sub64 r1, 120
+    ldxdw r2, [r10 - 16]            ; acct1 ptr (vault)
+    add64 r2, ACCT_KEY
+    call  cmp32
+    jne   r0, 0, err_bad_pda
+
+    ; ── compute leaf hash ─────────────────────────────────────────
+    ; buf_a = r10-152 (32 bytes), buf_b = r10-184 (32 bytes)
+    ; load acct0 ptr NOW — sha256_leaf clobbers r10-48..r10-1 (incl. account ptr slots)
+    ldxdw r1, [r10 - 8]           ; acct0 ptr
+    add64 r1, ACCT_KEY             ; r1 = &acct0.key  (user pubkey for leaf)
+    mov64 r2, r7
+    add64 r2, 0x11                 ; r2 = &ix_data[WD_L2_LAMPORTS]  (r7+8+0x09)
+    mov64 r3, r7
+    add64 r3, 0x19                 ; r3 = &ix_data[WD_L2_NONCE]     (r7+8+0x11)
+    mov64 r4, r10
+    sub64 r4, 152                  ; r4 = buf_a (output)
+    call  sha256_leaf              ; buf_a = sha256(pubkey || l2_lamports || l2_nonce)
+
+    ; ── merkle proof walk (4 siblings, unrolled) ──────────────────
+    ; r6 (callee-saved) = proof_index;  cur ping-pongs buf_a <-> buf_b each round
+    ldxw  r6, [r7 + 0x21]         ; r6 = proof_index (u32, zero-ext)
+
+    ; Round 0: cur=buf_a(r10-152), out=buf_b(r10-184), sibling=&ix[WD_SIBLINGS+0]
+    mov64 r4, r6
+    and64 r4, 1                    ; bit 0
+    mov64 r1, r10
+    sub64 r1, 152                  ; r1 = cur
+    mov64 r2, r7
+    add64 r2, 0x26                 ; r2 = sibling[0]  (r7+8+0x1E)
+    mov64 r3, r10
+    sub64 r3, 184                  ; r3 = out (buf_b)
+    jeq   r4, 0, merkle_r0_bit0
+    mov64 r4, r1
+    mov64 r1, r2
+    mov64 r2, r4                   ; bit=1: swap → sha256_pair(sibling, cur, out)
+    call  sha256_pair
+    ja    merkle_r1
+merkle_r0_bit0:
+    call  sha256_pair              ; bit=0: sha256_pair(cur, sibling, out)
+
+    ; Round 1: cur=buf_b(r10-184), out=buf_a(r10-152), sibling=&ix[WD_SIBLINGS+32]
+merkle_r1:
+    mov64 r4, r6
+    rsh64 r4, 1
+    and64 r4, 1                    ; bit 1
+    mov64 r1, r10
+    sub64 r1, 184                  ; r1 = cur (buf_b)
+    mov64 r2, r7
+    add64 r2, 0x46                 ; r2 = sibling[1]
+    mov64 r3, r10
+    sub64 r3, 152                  ; r3 = out (buf_a)
+    jeq   r4, 0, merkle_r1_bit0
+    mov64 r4, r1
+    mov64 r1, r2
+    mov64 r2, r4
+    call  sha256_pair
+    ja    merkle_r2
+merkle_r1_bit0:
+    call  sha256_pair
+
+    ; Round 2: cur=buf_a(r10-152), out=buf_b(r10-184), sibling=&ix[WD_SIBLINGS+64]
+merkle_r2:
+    mov64 r4, r6
+    rsh64 r4, 2
+    and64 r4, 1                    ; bit 2
+    mov64 r1, r10
+    sub64 r1, 152                  ; r1 = cur (buf_a)
+    mov64 r2, r7
+    add64 r2, 0x66                 ; r2 = sibling[2]
+    mov64 r3, r10
+    sub64 r3, 184                  ; r3 = out (buf_b)
+    jeq   r4, 0, merkle_r2_bit0
+    mov64 r4, r1
+    mov64 r1, r2
+    mov64 r2, r4
+    call  sha256_pair
+    ja    merkle_r3
+merkle_r2_bit0:
+    call  sha256_pair
+
+    ; Round 3: cur=buf_b(r10-184), out=buf_a(r10-152), sibling=&ix[WD_SIBLINGS+96]
+merkle_r3:
+    mov64 r4, r6
+    rsh64 r4, 3
+    and64 r4, 1                    ; bit 3
+    mov64 r1, r10
+    sub64 r1, 184                  ; r1 = cur (buf_b)
+    mov64 r2, r7
+    add64 r2, 0x86                 ; r2 = sibling[3]
+    mov64 r3, r10
+    sub64 r3, 152                  ; r3 = out (buf_a)
+    jeq   r4, 0, merkle_r3_bit0
+    mov64 r4, r1
+    mov64 r1, r2
+    mov64 r2, r4
+    call  sha256_pair
+    ja    merkle_check
+merkle_r3_bit0:
+    call  sha256_pair
+
+    ; ── Step 3: compare computed root against STATE_ROOT ──────────────────
+    ; final root always lands in buf_a (r10-152) after 4 rounds
+merkle_check:
+    mov64 r1, r10
+    sub64 r1, 152                  ; r1 = computed root
+    mov64 r2, r8
+    add64 r2, ACCT_DATA
+    add64 r2, STATE_ROOT           ; r2 = state.data[STATE_ROOT]
+    call  cmp32
+    jne   r0, 0, err_bad_proof
+
     lddw r0, 0
     exit
 
