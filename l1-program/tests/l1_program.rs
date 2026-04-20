@@ -16,6 +16,7 @@ const STATE_INITIALIZED: usize = 0x00;
 const STATE_SEQ_PUBKEY: usize = 0x01;
 const STATE_ROOT: usize = 0x21;
 const STATE_BATCH_NUM: usize = 0x41;
+const STATE_VAULT_LAMPORTS: usize = 0x49;
 const STATE_VAULT_BUMP: usize = 0x52;
 const STATE_WITHDRAW_MASK: usize = 0x53;
 
@@ -345,6 +346,27 @@ fn usr_ix(
     )
 }
 
+fn setup_initialized_full(
+    svm: &mut LiteSVM,
+    program_id: &Pubkey,
+    sequencer: &Pubkey,
+) -> (Pubkey, Pubkey) {
+    let (state_key, state_bump, vault_key, vault_bump) = setup_pdas(svm, program_id);
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 1_000_000_000).unwrap();
+    let ix = init_ix(
+        *program_id,
+        &payer.pubkey(),
+        state_key,
+        vault_key,
+        sequencer,
+        state_bump,
+        vault_bump,
+    );
+    send(svm, ix, &payer, &[&payer]).unwrap();
+    (state_key, vault_key)
+}
+
 fn setup_initialized(svm: &mut LiteSVM, program_id: &Pubkey, sequencer: &Pubkey) -> Pubkey {
     let (state_key, state_bump, vault_key, vault_bump) = setup_pdas(svm, program_id);
     let payer = Keypair::new();
@@ -468,6 +490,38 @@ fn test_usr_bad_batch_num() {
     assert_eq!(result.unwrap_err().err, custom_err(ERR_BAD_BATCH_NUM));
 }
 
+// ── Deposit helpers ───────────────────────────────────────────────────────────
+
+fn make_dep_ix_data(amount: u64) -> Vec<u8> {
+    let mut data = vec![0x02u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    data
+}
+
+fn dep_ix(
+    program_id: Pubkey,
+    user: &Pubkey,
+    vault_key: Pubkey,
+    state_key: Pubkey,
+    amount: u64,
+) -> Instruction {
+    Instruction::new_with_bytes(
+        program_id,
+        &make_dep_ix_data(amount),
+        vec![
+            AccountMeta::new(*user, true),
+            AccountMeta::new(vault_key, false),
+            AccountMeta::new(state_key, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    )
+}
+
+fn vault_lamports_tracked(svm: &LiteSVM, state_key: &Pubkey) -> u64 {
+    let d = svm.get_account(state_key).unwrap().data;
+    u64::from_le_bytes(d[STATE_VAULT_LAMPORTS..STATE_VAULT_LAMPORTS + 8].try_into().unwrap())
+}
+
 #[test]
 fn test_usr_sequential_batches() {
     let (mut svm, program_id) = setup();
@@ -488,4 +542,171 @@ fn test_usr_sequential_batches() {
             &batch.to_le_bytes()
         );
     }
+}
+
+// ── Deposit tests ─────────────────────────────────────────────────────────────
+
+#[test]
+fn test_deposit_success() {
+    let (mut svm, program_id) = setup();
+    let sequencer = Keypair::new();
+    let user = Keypair::new();
+    let amount = 1_000_000_000u64;
+    svm.airdrop(&user.pubkey(), 10 * amount).unwrap();
+    let (state_key, vault_key) = setup_initialized_full(&mut svm, &program_id, &sequencer.pubkey());
+
+    let vault_before = svm.get_account(&vault_key).unwrap().lamports;
+    let user_before = svm.get_account(&user.pubkey()).unwrap().lamports;
+
+    let ix = dep_ix(program_id, &user.pubkey(), vault_key, state_key, amount);
+    let result = send(&mut svm, ix, &user, &[&user]);
+    print_logs("deposit_success", &result);
+    assert!(result.is_ok());
+
+    // vault received exact amount
+    assert_eq!(svm.get_account(&vault_key).unwrap().lamports, vault_before + amount);
+
+    // user paid at least the amount (fees on top)
+    assert!(svm.get_account(&user.pubkey()).unwrap().lamports <= user_before - amount);
+
+    // STATE_VAULT_LAMPORTS tracked correctly
+    assert_eq!(vault_lamports_tracked(&svm, &state_key), amount);
+}
+
+#[test]
+fn test_deposit_accumulates() {
+    let (mut svm, program_id) = setup();
+    let sequencer = Keypair::new();
+    let user = Keypair::new();
+    svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+    let (state_key, vault_key) = setup_initialized_full(&mut svm, &program_id, &sequencer.pubkey());
+
+    let amount = 500_000_000u64;
+    for i in 1u64..=3 {
+        svm.expire_blockhash();
+        let ix = dep_ix(program_id, &user.pubkey(), vault_key, state_key, amount);
+        send(&mut svm, ix, &user, &[&user]).unwrap();
+        assert_eq!(vault_lamports_tracked(&svm, &state_key), amount * i);
+    }
+}
+
+#[test]
+fn test_deposit_wrong_acct_count() {
+    let (mut svm, program_id) = setup();
+    let sequencer = Keypair::new();
+    let user = Keypair::new();
+    svm.airdrop(&user.pubkey(), 2_000_000_000).unwrap();
+    let (state_key, vault_key) = setup_initialized_full(&mut svm, &program_id, &sequencer.pubkey());
+
+    // 3 accounts instead of 4 (missing system program)
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &make_dep_ix_data(1_000_000_000),
+        vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(vault_key, false),
+            AccountMeta::new(state_key, false),
+        ],
+    );
+    let result = send(&mut svm, ix, &user, &[&user]);
+    print_logs("deposit_wrong_acct_count", &result);
+    assert_eq!(result.unwrap_err().err, custom_err(ERR_WRONG_ACCT_COUNT));
+}
+
+#[test]
+fn test_deposit_not_signer() {
+    let (mut svm, program_id) = setup();
+    let sequencer = Keypair::new();
+    let user = Keypair::new();
+    let payer = Keypair::new();
+    svm.airdrop(&user.pubkey(), 2_000_000_000).unwrap();
+    svm.airdrop(&payer.pubkey(), 2_000_000_000).unwrap();
+    let (state_key, vault_key) = setup_initialized_full(&mut svm, &program_id, &sequencer.pubkey());
+
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &make_dep_ix_data(1_000_000_000),
+        vec![
+            AccountMeta::new(user.pubkey(), false), // not signer
+            AccountMeta::new(vault_key, false),
+            AccountMeta::new(state_key, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let result = send(&mut svm, ix, &payer, &[&payer]);
+    print_logs("deposit_not_signer", &result);
+    assert_eq!(result.unwrap_err().err, custom_err(ERR_NOT_SIGNER));
+}
+
+#[test]
+fn test_deposit_not_initialized() {
+    let (mut svm, program_id) = setup();
+    let user = Keypair::new();
+    svm.airdrop(&user.pubkey(), 2_000_000_000).unwrap();
+    let (state_key, _, vault_key, _) = setup_pdas(&mut svm, &program_id);
+
+    let ix = dep_ix(program_id, &user.pubkey(), vault_key, state_key, 1_000_000_000);
+    let result = send(&mut svm, ix, &user, &[&user]);
+    print_logs("deposit_not_initialized", &result);
+    assert_eq!(result.unwrap_err().err, custom_err(ERR_NOT_INITIALIZED));
+}
+
+#[test]
+fn test_deposit_bad_pda() {
+    let (mut svm, program_id) = setup();
+    let sequencer = Keypair::new();
+    let user = Keypair::new();
+    svm.airdrop(&user.pubkey(), 2_000_000_000).unwrap();
+    let (state_key, _) = setup_initialized_full(&mut svm, &program_id, &sequencer.pubkey());
+
+    let wrong_vault = Keypair::new();
+    svm.set_account(
+        wrong_vault.pubkey(),
+        Account {
+            lamports: 890_880,
+            data: vec![],
+            owner: program_id,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &make_dep_ix_data(1_000_000_000),
+        vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(wrong_vault.pubkey(), false),
+            AccountMeta::new(state_key, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let result = send(&mut svm, ix, &user, &[&user]);
+    print_logs("deposit_bad_pda", &result);
+    assert_eq!(result.unwrap_err().err, custom_err(ERR_BAD_PDA));
+}
+
+#[test]
+fn test_deposit_truncated_data() {
+    let (mut svm, program_id) = setup();
+    let sequencer = Keypair::new();
+    let user = Keypair::new();
+    svm.airdrop(&user.pubkey(), 2_000_000_000).unwrap();
+    let (state_key, vault_key) = setup_initialized_full(&mut svm, &program_id, &sequencer.pubkey());
+
+    // discriminator only, no amount field
+    let ix = Instruction::new_with_bytes(
+        program_id,
+        &[0x02],
+        vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(vault_key, false),
+            AccountMeta::new(state_key, false),
+            AccountMeta::new_readonly(system_program::id(), false),
+        ],
+    );
+    let result = send(&mut svm, ix, &user, &[&user]);
+    print_logs("deposit_truncated_data", &result);
+    assert_eq!(result.unwrap_err().err, custom_err(ERR_INVALID_IX));
 }
