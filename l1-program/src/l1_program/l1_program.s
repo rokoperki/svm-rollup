@@ -124,11 +124,11 @@ find_ix_data_done:
 ; ── Instruction stubs (to be implemented) ─────────────────────────────────────
 
 initialize:
-    ; data_len == 3
+    ; ix_num_accts == 3
     ldxdw r3, [r1 + NUM_ACCOUNTS]
     jne r3, 3, err_wrong_acct_count
 
-    ; ix_num_accts >= INIT_IX_LEN
+    ; data_len >= INIT_IX_LEN
     ldxdw r3, [r7 + 0]
     jlt r3, INIT_IX_LEN, err_invalid_ix
 
@@ -195,7 +195,7 @@ initialize:
     call  cmp32
     jne   r0, 0, err_bad_pda
 
-    ; ── step 8: verify vault PDA ──────────────────────
+    ; ── verify vault PDA ──────────────────────
     lddw  r2, seed_vault
     stxdw [r5 + 0], r2              ; SolBytes[0].ptr = &"vault"
     ; SolBytes[0].len already = 5, SolBytes[1].len already = 1 — reuse
@@ -223,7 +223,7 @@ initialize:
     call  cmp32
     jne   r0, 0, err_bad_pda
 
-    ; ── step 9: write state fields ────────────────────
+    ; ──  write state fields ────────────────────
     mov64 r6, r8
     add64 r6, ACCT_DATA            ; r6 = &state.data[0]
 
@@ -264,6 +264,61 @@ initialize:
     exit
 
 update_state_root:
+    ; num_accounts == 2
+    ldxdw r3, [r1 + NUM_ACCOUNTS]
+    jne r3, 2, err_wrong_acct_count
+
+    ; ix_data_len >= USR_IX_LEN
+    ldxdw r3, [r7 + 0]
+    jlt r3, USR_IX_LEN, err_invalid_ix
+
+    ; acct0.is_signer == 1
+    ldxdw r3, [r10 - 8]
+    ldxb r2, [r3 + ACCT_IS_SIGNER]
+    jne r2, 1, err_not_signer
+
+    ; acct1.is_writable == 1
+    ldxdw r3, [r10 - 16]
+    ldxb r2, [r3 + ACCT_IS_WRITE]
+    jne r2, 1, err_not_writable
+
+    ; acct1.dlen == STATE_SZ
+    ldxdw r2, [r3 + ACCT_DLEN]
+    jne r2, STATE_SZ, err_wrong_acct_size
+
+    ; acct1.data[STATE_INITIALIZED] == 1
+    ldxb r2, [r3 + ACCT_DATA + STATE_INITIALIZED]
+    jne r2, 1, err_not_initialized
+
+    mov64 r8, r3                         ; save acct1 ptr (callee-saved)
+
+    ; acct0.key == state.data[STATE_SEQ_PUBKEY]
+    ldxdw r1, [r10 - 8]
+    add64 r1, ACCT_KEY
+    mov64 r2, r8
+    add64 r2, ACCT_DATA
+    add64 r2, STATE_SEQ_PUBKEY
+    call cmp32
+    jne r0, 0, err_wrong_sequencer
+
+    ; ix_data[USR_BATCH_NUM] == state.data[STATE_BATCH_NUM] + 1
+    ldxdw r2, [r8 + ACCT_DATA + STATE_BATCH_NUM]
+    add64 r2, 1
+    ldxdw r1, [r7 + 8 + USR_BATCH_NUM]  ; r7+8 = ix_data[0], +0x21 = batch_num field
+    jne r1, r2, err_bad_batch_num
+
+    ; write new root: copy32(dst=state+STATE_ROOT, src=ix_data[USR_NEW_ROOT])
+    mov64 r1, r8
+    add64 r1, ACCT_DATA
+    add64 r1, STATE_ROOT
+    mov64 r2, r7
+    add64 r2, 9                          ; r2 = &ix_data[USR_NEW_ROOT]  (r7+8+1)
+    call copy32
+
+    ; write new batch_num
+    ldxdw r2, [r7 + 8 + USR_BATCH_NUM]  ; = [r7 + 0x29]
+    stxdw [r8 + ACCT_DATA + STATE_BATCH_NUM], r2
+
     lddw r0, 0
     exit
 
