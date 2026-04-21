@@ -395,7 +395,7 @@ deposit:
     ; SolAccountMeta = { pubkey_ptr:8, is_writable:1, is_signer:1, pad:6 } = 16 bytes
     ; offsets must be divisible by 8 for pointer alignment
     mov64 r1, r10
-    sub64 r1, 88                    ; 88 = 8×11 ✓
+    sub64 r1, 88
     ldxdw r2, [r10 - 8]
     mov64 r3, 1
     mov64 r4, 1
@@ -403,7 +403,7 @@ deposit:
 
     ; meta[1] vault_pda {writable=1, signer=0}
     mov64 r1, r10
-    sub64 r1, 72                    ; r10-88+16 = r10-72, 72 = 8×9 ✓
+    sub64 r1, 72
     ldxdw r2, [r10 - 16]
     mov64 r3, 1
     mov64 r4, 0
@@ -645,7 +645,7 @@ merkle_r3:
 merkle_r3_bit0:
     call  sha256_pair
 
-    ; ── Step 3: compare computed root against STATE_ROOT ──────────────────
+    ; ── compare computed root against STATE_ROOT ──────────────────
     ; final root always lands in buf_a (r10-152) after 4 rounds
 merkle_check:
     mov64 r1, r10
@@ -655,6 +655,112 @@ merkle_check:
     add64 r2, STATE_ROOT           ; r2 = state.data[STATE_ROOT]
     call  cmp32
     jne   r0, 0, err_bad_proof
+
+    ; ── set withdrawal bit ───────────────────────────────────────────
+    ; r6 = proof_index, r8 = state PDA ptr
+    ldxh  r2, [r8 + ACCT_DATA + STATE_WITHDRAW_MASK]
+    and64 r6, 0xF
+    mov64 r3, 1
+    lsh64 r3, r6
+    or64  r2, r3
+    stxh  [r8 + ACCT_DATA + STATE_WITHDRAW_MASK], r2
+
+    ; ── debit STATE_VAULT_LAMPORTS ───────────────────────────────────
+    ldxdw r2, [r8 + ACCT_DATA + STATE_VAULT_LAMPORTS]
+    ldxdw r3, [r7 + 9]              ; WD_AMOUNT (ix_data body offset 0x01)
+    sub64 r2, r3
+    stxdw [r8 + ACCT_DATA + STATE_VAULT_LAMPORTS], r2
+
+    ; transfer ix_data
+    mov64 r2, 2                 ; transfer discriminator
+    stxw [r10 - 52], r2
+    ldxdw r2, [r7 + 9]          ; amount
+    stxdw [r10 - 48], r2
+
+    ; meta[0] vault_pda {writable=1, signer=1}
+    mov64 r1, r10
+    sub64 r1, 88
+    ldxdw r2, [r10 - 16]
+    mov64 r3, 1
+    mov64 r4, 1
+    call fill_meta
+
+    ; meta[1] user {writable=1, signer=1}
+    mov64 r1, r10
+    sub64 r1, 72
+    ldxdw r2, [r10 - 8]
+    mov64 r3, 1
+    mov64 r4, 1
+    call fill_meta
+
+    ; SolInstruction base (40 bytes)
+    ldxdw r2, [r10 - 32]
+    add64 r2, ACCT_KEY
+    stxdw [r10 - 136], r2           ; program_id ptr
+    mov64 r2, r10
+    sub64 r2, 88
+    stxdw [r10 - 128], r2           ; accounts_ptr → meta[0] at r10-88
+    mov64 r2, 2
+    stxdw [r10 - 120], r2           ; num_accounts
+    mov64 r2, r10
+    sub64 r2, 52
+    stxdw [r10 - 112], r2           ; ix_data ptr = r10-52
+    mov64 r2, 12
+    stxdw [r10 - 104], r2           ; ix_data_len
+
+    ; SolAccount[0] vault_pda (acct0)
+    ; SolAccountInfo = 56 bytes padded (51 data + 5 pad)
+    mov64 r1, r10
+    sub64 r1, 248
+    ldxdw r2, [r10 - 16]
+    ldxdw r3, [r10 - 24]
+    mov64 r4, 1
+    mov64 r5, 1
+    call fill_acct_info
+
+    ; SolAccount[1] user (acct0)
+    mov64 r1, r10
+    sub64 r1, 192                   ; r10-248+56 = r10-192
+    ldxdw r2, [r10 - 8]
+    ldxdw r3, [r10 - 16]
+    mov64 r4, 1
+    mov64 r5, 1
+    call fill_acct_info
+
+    ; ── PDA signer seeds: [b"vault", bump] ───────────────────────────────────
+    ; bump byte at r10-256
+    ldxb  r2, [r8 + ACCT_DATA + STATE_VAULT_BUMP]
+    stxb  [r10 - 256], r2
+
+    ; SolBytes[2] at r10-288: [{&"vault",5}, {&bump,1}]
+    lddw  r2, seed_vault
+    stxdw [r10 - 288], r2           ; seeds[0].ptr = &"vault"
+    mov64 r2, 5
+    stxdw [r10 - 280], r2           ; seeds[0].len = 5
+    mov64 r2, r10
+    sub64 r2, 256
+    stxdw [r10 - 272], r2           ; seeds[1].ptr = &bump
+    mov64 r2, 1
+    stxdw [r10 - 264], r2           ; seeds[1].len = 1
+
+    ; SolSignerSeeds[1] at r10-304: [{&SolBytes,2}]
+    mov64 r2, r10
+    sub64 r2, 288
+    stxdw [r10 - 304], r2           ; signer_seeds[0].addr = SolBytes array
+    mov64 r2, 2
+    stxdw [r10 - 296], r2           ; signer_seeds[0].len = 2
+
+    ; invoke CPI
+    mov64 r1, r10
+    sub64 r1, 136                   ; SolInstruction ptr
+    mov64 r2, r10
+    sub64 r2, 248                   ; SolAccountInfo array ptr
+    mov64 r3, 2                     ; infos_len
+    mov64 r4, r10
+    sub64 r4, 304                   ; signers_seeds ptr
+    mov64 r5, 1                     ; signers_seeds_len
+    call  sol_invoke_signed_c
+    jne   r0, 0, err_invalid_ix
 
     lddw r0, 0
     exit
